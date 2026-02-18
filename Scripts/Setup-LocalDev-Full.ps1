@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    1. Clones the Library and two Apps.
-    2. Links them via LocalDev.targets (swapping NuGet for Source).
-    3. Creates a unified 'LocalDev.sln' for Visual Studio.
+    1. Clones the Library and two Apps (Handles Azure DevOps URLs properly).
+    2. Links them via LocalDev.targets.
+    3. Creates a unified 'LocalDev.sln'.
 #>
 
 param (
@@ -31,7 +31,9 @@ function Clone-Repo {
 
     $finalUrl = $Url
     if ($Creds) {
-        $cleanUrl = $Url -replace "^https?://", ""
+        # FIX: Regex now removes "https://" AND any existing "user@" (like azetagrupo@)
+        # This prevents the double-@ error.
+        $cleanUrl = $Url -replace "^https?://([^@]+@)?", ""
         $finalUrl = "https://$($Creds.User):$($Creds.Token)@$cleanUrl"
     }
 
@@ -41,12 +43,17 @@ function Clone-Repo {
     else {
         Write-Host "  Cloning $DestName..." -ForegroundColor Green
         git clone $finalUrl "$RootFolder\$DestName"
-        if ($LASTEXITCODE -ne 0) { Write-Error "Clone failed for $DestName"; exit 1 }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Clone failed for $DestName"
+            Read-Host "Press Enter to exit..."
+            exit 1
+        }
     }
 }
 
 # --- Main Logic ---
 
+Clear-Host
 Write-Host "`n=== .NET Unified Local Dev Setup ===`n" -ForegroundColor Cyan
 
 # 1. Gather Info
@@ -67,7 +74,12 @@ Clone-Repo -Url $app2Url -Creds $creds -DestName $app2Name
 # 3. Analyze Library Project
 Write-Host "`nConfiguring References..." -ForegroundColor Cyan
 $libCsproj = Get-ChildItem -Path "$RootFolder\$libName" -Filter "*.csproj" -Recurse | Select-Object -First 1
-if (-not $libCsproj) { Write-Error "Could not find .csproj in library repo!"; exit 1 }
+
+if (-not $libCsproj) {
+    Write-Error "Could not find .csproj in library repo!"
+    Read-Host "Press Enter to exit..."
+    exit 1
+}
 
 [xml]$libXml = Get-Content $libCsproj.FullName
 $packageId = $libXml.Project.PropertyGroup.PackageId
@@ -104,10 +116,12 @@ foreach ($app in $apps) {
     $gitignorePath = Join-Path $app.Path ".gitignore"
     if (Test-Path $gitignorePath) {
         $gitContent = Get-Content $gitignorePath
-        if ($gitContent -notcontains $targetFileName) { Add-Content -Path $gitignorePath -Value "`n$targetFileName" }
+        if ($gitContent -notcontains $targetFileName) {
+            Add-Content -Path $gitignorePath -Value "`n$targetFileName"
+        }
     }
 
-    # Inject Import into .csproj
+    # Inject Import into .csproj safely
     [xml]$appXml = Get-Content $appCsproj.FullName
     $existingImport = $appXml.Project.Import | Where-Object { $_.Project -eq $targetFileName }
 
@@ -115,37 +129,41 @@ foreach ($app in $apps) {
         $newImport = $appXml.CreateElement("Import", $appXml.Project.NamespaceURI)
         $newImport.SetAttribute("Project", $targetFileName)
         $newImport.SetAttribute("Condition", "Exists('$targetFileName')")
+
         $appXml.Project.AppendChild($newImport) | Out-Null
         $appXml.Save($appCsproj.FullName)
         Write-Host "  Linked Library to $($app.Name)" -ForegroundColor Green
+    } else {
+        Write-Host "  Link already exists for $($app.Name)" -ForegroundColor Yellow
     }
 }
 
-# 5. Create Unified Solution (The New Part)
+# 5. Create Unified Solution
 $slnName = "LocalDev.sln"
 $slnPath = "$RootFolder\$slnName"
 
 Write-Host "`nGenerating Unified Solution ($slnName)..." -ForegroundColor Cyan
 
 if (Test-Path $slnPath) {
-    # If it exists, we just update it
-    Write-Host "  Solution already exists, refreshing projects..." -ForegroundColor Yellow
+    Write-Host "  Solution already exists, adding missing projects..." -ForegroundColor Yellow
 } else {
     dotnet new sln -n "LocalDev" -o $RootFolder | Out-Null
     Write-Host "  Created new empty solution." -ForegroundColor Green
 }
 
 # Add Library to Solution
-dotnet sln $slnPath add $libCsproj.FullName --in-root
+dotnet sln $slnPath add $libCsproj.FullName --in-root > $null
 Write-Host "  Added Library project." -ForegroundColor Gray
 
 # Add Apps to Solution
 foreach ($app in $apps) {
     $appCsproj = Get-ChildItem -Path $app.Path -Filter "*.csproj" -Recurse | Select-Object -First 1
     if ($appCsproj) {
-        dotnet sln $slnPath add $appCsproj.FullName --in-root
+        dotnet sln $slnPath add $appCsproj.FullName --in-root > $null
         Write-Host "  Added $($app.Name) project." -ForegroundColor Gray
     }
 }
 
 Write-Host "`nSUCCESS! Open '$slnName' in Visual Studio to start coding." -ForegroundColor Green
+Write-Host "`n------------------------------------------------"
+Read-Host "Press Enter to exit..."

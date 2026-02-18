@@ -2,9 +2,10 @@
 .SYNOPSIS
     1. Creates a folder 'AzApp_Workplace' on your Desktop.
     2. Clones the specific AzApp repositories into it.
-    3. Smart-detects the correct .csproj (ignoring Test projects).
-    4. Links them via LocalDev.targets.
-    5. Creates a unified 'LocalDev.sln' inside that folder.
+    3. LOGS the content of each repo immediately after cloning.
+    4. Smart-detects the correct .csproj (ignoring Test projects).
+    5. Links them via LocalDev.targets.
+    6. Creates a unified 'LocalDev.sln' inside that folder.
 #>
 
 # --- SETUP DESTINATION ---
@@ -47,15 +48,27 @@ function Clone-Repo {
 
     if (Test-Path "$RootFolder\$DestName") {
         Write-Host "  Folder '$DestName' already exists. Skipping clone." -ForegroundColor Yellow
+        # Optional: List content even if it already exists
+        # Get-ChildItem "$RootFolder\$DestName" | Select-Object Name, Mode | Format-Table -AutoSize | Out-String | Write-Host -ForegroundColor DarkGray
     }
     else {
         Write-Host "  Cloning $DestName..." -ForegroundColor Green
         git clone $finalUrl "$RootFolder\$DestName"
+
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Clone failed for $DestName"
             Read-Host "Press Enter to exit..."
             exit 1
         }
+
+        # --- LOG CONTENT ---
+        Write-Host "  [Content of $DestName]" -ForegroundColor Cyan
+        try {
+            Get-ChildItem "$RootFolder\$DestName" | Select-Object Name, Mode, LastWriteTime | Format-Table -AutoSize | Out-String | Write-Host -ForegroundColor DarkGray
+        } catch {
+            Write-Warning "Could not list files for $DestName"
+        }
+        Write-Host "------------------------------------------------" -ForegroundColor Gray
     }
 }
 

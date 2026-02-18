@@ -1,29 +1,39 @@
 <#
 .SYNOPSIS
-    1. Clones the Library and two Apps (Handles Azure DevOps URLs properly).
-    2. Links them via LocalDev.targets.
-    3. Creates a unified 'LocalDev.sln'.
+    1. Creates a folder 'AzApp_Workplace' on your Desktop.
+    2. Clones the specific AzApp repositories into it.
+    3. Smart-detects the correct .csproj (ignoring Test projects).
+    4. Links them via LocalDev.targets.
+    5. Creates a unified 'LocalDev.sln' inside that folder.
 #>
 
-param (
-    [string]$RootFolder = (Get-Location)
-)
+# --- SETUP DESTINATION ---
+$DesktopPath = [Environment]::GetFolderPath("Desktop")
+$WorkFolder = "AzApp_Workplace"
+$RootFolder = Join-Path $DesktopPath $WorkFolder
 
-# --- Configuration Helper ---
-function Get-RepoUrl {
-    param ([string]$Prompt)
-    $url = Read-Host -Prompt $Prompt
-    return $url.Trim()
+# Create the directory if it doesn't exist
+if (-not (Test-Path $RootFolder)) {
+    New-Item -ItemType Directory -Force -Path $RootFolder | Out-Null
 }
 
+# --- HARDCODED URLS ---
+$libUrl  = "https://azetagrupo@dev.azure.com/azetagrupo/D365/_git/AzApp.DataEntity"
+$app1Url = "https://azetagrupo@dev.azure.com/azetagrupo/D365/_git/BackendAzApp"
+$app2Url = "https://azetagrupo@dev.azure.com/azetagrupo/D365/_git/AzServicesQueue"
+
+# --- Configuration Helper ---
 function Get-Credentials {
-    $useCreds = Read-Host "Do you want to embed a PAT (Personal Access Token) for cloning? (y/n) [Default: n]"
-    if ($useCreds -eq 'y') {
-        $user = Read-Host "Username"
-        $token = Read-Host "PAT/Password"
-        return @{ User = $user; Token = $token }
-    }
-    return $null
+    Clear-Host
+    Write-Host "`n=== AzApp Unified Local Dev Setup ===`n" -ForegroundColor Cyan
+    Write-Host "Target Folder: $RootFolder" -ForegroundColor Gray
+    Write-Host "------------------------------------------------"
+    Write-Host "Please enter your Git Credentials (from the 'Generate Git Credentials' button):" -ForegroundColor Yellow
+    $user = Read-Host "Username"
+    $token = Read-Host "Password/PAT"
+
+    if (-not $token) { return $null }
+    return @{ User = $user; Token = $token }
 }
 
 function Clone-Repo {
@@ -31,8 +41,6 @@ function Clone-Repo {
 
     $finalUrl = $Url
     if ($Creds) {
-        # FIX: Regex now removes "https://" AND any existing "user@" (like azetagrupo@)
-        # This prevents the double-@ error.
         $cleanUrl = $Url -replace "^https?://([^@]+@)?", ""
         $finalUrl = "https://$($Creds.User):$($Creds.Token)@$cleanUrl"
     }
@@ -53,14 +61,8 @@ function Clone-Repo {
 
 # --- Main Logic ---
 
-Clear-Host
-Write-Host "`n=== .NET Unified Local Dev Setup ===`n" -ForegroundColor Cyan
-
-# 1. Gather Info
-$libUrl  = Get-RepoUrl "Enter URL for the SHARED LIBRARY repo"
-$app1Url = Get-RepoUrl "Enter URL for APP #1 repo"
-$app2Url = Get-RepoUrl "Enter URL for APP #2 repo"
-$creds   = Get-Credentials
+# 1. Gather Credentials
+$creds = Get-Credentials
 
 # 2. Clone Repositories
 $libName = ($libUrl -split '/')[-1] -replace '\.git$', ''
@@ -71,12 +73,17 @@ Clone-Repo -Url $libUrl -Creds $creds -DestName $libName
 Clone-Repo -Url $app1Url -Creds $creds -DestName $app1Name
 Clone-Repo -Url $app2Url -Creds $creds -DestName $app2Name
 
-# 3. Analyze Library Project
+# 3. Analyze Library Project (SMARTER SELECTION)
 Write-Host "`nConfiguring References..." -ForegroundColor Cyan
-$libCsproj = Get-ChildItem -Path "$RootFolder\$libName" -Filter "*.csproj" -Recurse | Select-Object -First 1
+
+# Find all csproj files in the library folder
+$allLibProjects = Get-ChildItem -Path "$RootFolder\$libName" -Filter "*.csproj" -Recurse
+
+# Filter OUT any project that contains "Test" in the name to ensure we get the SRC project
+$libCsproj = $allLibProjects | Where-Object { $_.Name -notmatch "Test" } | Select-Object -First 1
 
 if (-not $libCsproj) {
-    Write-Error "Could not find .csproj in library repo!"
+    Write-Error "Could not find a valid Library .csproj (ignoring Tests) in $libName!"
     Read-Host "Press Enter to exit..."
     exit 1
 }
@@ -86,7 +93,8 @@ $packageId = $libXml.Project.PropertyGroup.PackageId
 if (-not $packageId) { $packageId = $libXml.Project.PropertyGroup.AssemblyName }
 if (-not $packageId) { $packageId = $libCsproj.BaseName }
 
-Write-Host "  Library: $($libCsproj.Name) (PackageId: $packageId)" -ForegroundColor Gray
+Write-Host "  Library Found: $($libCsproj.Name)" -ForegroundColor Green
+Write-Host "  Package ID:    $packageId" -ForegroundColor Gray
 
 # 4. Create Targets File & Inject Import
 $targetFileName = "LocalDev.targets"
@@ -96,10 +104,14 @@ $apps = @(
 )
 
 foreach ($app in $apps) {
-    $appCsproj = Get-ChildItem -Path $app.Path -Filter "*.csproj" -Recurse | Select-Object -First 1
-    if (-not $appCsproj) { continue }
+    # Find App csproj (Also ignoring Tests just in case)
+    $appCsproj = Get-ChildItem -Path $app.Path -Filter "*.csproj" -Recurse | Where-Object { $_.Name -notmatch "Test" } | Select-Object -First 1
 
-    # Create the targets file content
+    if (-not $appCsproj) {
+        Write-Warning "  No .csproj found in $($app.Name). Skipping."
+        continue
+    }
+
     $targetsContent = @"
 <Project>
   <ItemGroup>
@@ -108,11 +120,9 @@ foreach ($app in $apps) {
   </ItemGroup>
 </Project>
 "@
-    # Write targets file
     $targetsPath = Join-Path $appCsproj.DirectoryName $targetFileName
     $targetsContent | Set-Content -Path $targetsPath
 
-    # Add to .gitignore
     $gitignorePath = Join-Path $app.Path ".gitignore"
     if (Test-Path $gitignorePath) {
         $gitContent = Get-Content $gitignorePath
@@ -121,7 +131,6 @@ foreach ($app in $apps) {
         }
     }
 
-    # Inject Import into .csproj safely
     [xml]$appXml = Get-Content $appCsproj.FullName
     $existingImport = $appXml.Project.Import | Where-Object { $_.Project -eq $targetFileName }
 
@@ -140,30 +149,43 @@ foreach ($app in $apps) {
 
 # 5. Create Unified Solution
 $slnName = "LocalDev.sln"
-$slnPath = "$RootFolder\$slnName"
 
 Write-Host "`nGenerating Unified Solution ($slnName)..." -ForegroundColor Cyan
 
-if (Test-Path $slnPath) {
-    Write-Host "  Solution already exists, adding missing projects..." -ForegroundColor Yellow
-} else {
-    dotnet new sln -n "LocalDev" -o $RootFolder | Out-Null
-    Write-Host "  Created new empty solution." -ForegroundColor Green
-}
+# Change context to the WORKPLACE folder on Desktop
+Push-Location $RootFolder
 
-# Add Library to Solution
-dotnet sln $slnPath add $libCsproj.FullName --in-root > $null
-Write-Host "  Added Library project." -ForegroundColor Gray
+try {
+    # 1. Create Solution if missing
+    if (-not (Test-Path $slnName)) {
+        dotnet new sln -n "LocalDev"
+        Write-Host "  Created new empty solution." -ForegroundColor Green
+    } else {
+        Write-Host "  Solution already exists." -ForegroundColor Yellow
+    }
 
-# Add Apps to Solution
-foreach ($app in $apps) {
-    $appCsproj = Get-ChildItem -Path $app.Path -Filter "*.csproj" -Recurse | Select-Object -First 1
-    if ($appCsproj) {
-        dotnet sln $slnPath add $appCsproj.FullName --in-root > $null
-        Write-Host "  Added $($app.Name) project." -ForegroundColor Gray
+    # 2. Add Library (Using Quotes for safety)
+    dotnet sln $slnName add "$($libCsproj.FullName)"
+    Write-Host "  Added Library project." -ForegroundColor Gray
+
+    # 3. Add Apps
+    foreach ($app in $apps) {
+        $appCsproj = Get-ChildItem -Path $app.Path -Filter "*.csproj" -Recurse | Where-Object { $_.Name -notmatch "Test" } | Select-Object -First 1
+        if ($appCsproj) {
+            dotnet sln $slnName add "$($appCsproj.FullName)"
+            Write-Host "  Added $($app.Name) project." -ForegroundColor Gray
+        }
     }
 }
+catch {
+    Write-Error "Error updating solution: $_"
+}
+finally {
+    # Always return to original folder
+    Pop-Location
+}
 
-Write-Host "`nSUCCESS! Open '$slnName' in Visual Studio to start coding." -ForegroundColor Green
+Write-Host "`nSUCCESS! Check your Desktop for the 'AzApp_Workplace' folder." -ForegroundColor Green
+Write-Host "Open '$WorkFolder\LocalDev.sln' to start."
 Write-Host "`n------------------------------------------------"
 Read-Host "Press Enter to exit..."
